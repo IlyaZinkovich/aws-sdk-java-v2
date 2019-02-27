@@ -24,6 +24,7 @@ import static software.amazon.awssdk.http.nio.netty.internal.ChannelAttributeKey
 import com.typesafe.netty.http.HttpStreamsClientHandler;
 import com.typesafe.netty.http.StreamedHttpResponse;
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler.Sharable;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -129,21 +130,19 @@ public class ResponseHandler extends SimpleChannelInboundHandler<HttpObject> {
         RequestContext requestContext = ctx.channel().attr(REQUEST_CONTEXT_KEY).get();
         log.debug("Exception processing request: {}", requestContext.executeRequest().request(), cause);
         Throwable throwable = wrapException(cause);
-        requestContext.handler().onError(throwable);
         executeFuture(ctx).completeExceptionally(throwable);
+        runAndLogError("Fail to execute SdkAsyncHttpResponseHandler#onError", () -> requestContext.handler().onError(throwable));
         runAndLogError("Could not release channel back to the pool", () -> closeAndRelease(ctx));
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext handlerCtx) throws Exception {
-        RequestContext requestCtx = handlerCtx.channel().attr(REQUEST_CONTEXT_KEY).get();
-        boolean responseCompleted = handlerCtx.channel().attr(RESPONSE_COMPLETE_KEY).get();
-        if (!responseCompleted) {
-            IOException err = new IOException("Server failed to send complete response");
-            requestCtx.handler().onError(err);
-            executeFuture(handlerCtx).completeExceptionally(err);
-            runAndLogError("Could not release channel", () -> closeAndRelease(handlerCtx));
-        }
+        notifyIfResponseNotCompleted(handlerCtx);
+    }
+
+    @Override
+    public void channelUnregistered(ChannelHandlerContext handlerCtx) throws Exception {
+        notifyIfResponseNotCompleted(handlerCtx);
     }
 
     public static ResponseHandler getInstance() {
@@ -156,9 +155,9 @@ public class ResponseHandler extends SimpleChannelInboundHandler<HttpObject> {
      * @param ctx Context for channel
      */
     private static void closeAndRelease(ChannelHandlerContext ctx) {
-        RequestContext requestContext = ctx.channel().attr(REQUEST_CONTEXT_KEY).get();
-        ctx.channel().close();
-        requestContext.channelPool().release(ctx.channel());
+        Channel channel = ctx.channel();
+        RequestContext requestContext = channel.attr(REQUEST_CONTEXT_KEY).get();
+        channel.close().addListener(i -> requestContext.channelPool().release(channel));
     }
 
     /**
@@ -246,11 +245,16 @@ public class ResponseHandler extends SimpleChannelInboundHandler<HttpObject> {
                     if (isDone.get()) {
                         return;
                     }
-                    // Needed to prevent use-after-free bug if the subscriber's onNext is asynchronous
-                    ByteBuffer b = copyToByteBuffer(httpContent.content());
-                    httpContent.release();
-                    subscriber.onNext(b);
-                    channelContext.read();
+
+                    try {
+                        // Needed to prevent use-after-free bug if the subscriber's onNext is asynchronous
+                        ByteBuffer b = copyToByteBuffer(httpContent.content());
+                        httpContent.release();
+                        subscriber.onNext(b);
+                        channelContext.read();
+                    } catch (Throwable throwable) {
+                        onError(throwable);
+                    }
                 }
 
                 @Override
@@ -364,5 +368,16 @@ public class ResponseHandler extends SimpleChannelInboundHandler<HttpObject> {
         }
 
         return originalCause;
+    }
+
+    private void notifyIfResponseNotCompleted(ChannelHandlerContext handlerCtx) {
+        RequestContext requestCtx = handlerCtx.channel().attr(REQUEST_CONTEXT_KEY).get();
+        boolean responseCompleted = handlerCtx.channel().attr(RESPONSE_COMPLETE_KEY).get();
+        if (!responseCompleted) {
+            IOException err = new IOException("Server failed to send complete response");
+            runAndLogError("Fail to execute SdkAsyncHttpResponseHandler#onError", () -> requestCtx.handler().onError(err));
+            executeFuture(handlerCtx).completeExceptionally(err);
+            runAndLogError("Could not release channel", () -> closeAndRelease(handlerCtx));
+        }
     }
 }
